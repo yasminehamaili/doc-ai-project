@@ -1,0 +1,670 @@
+
+===== backend\server.js =====
+
+import express from "express";
+import cors from "cors";
+import multer from "multer";
+import { randomUUID } from "node:crypto";
+import "dotenv/config";
+
+import { chat, extractJson } from "./llm.js";
+import { extractText } from "./extract-text.js";
+import { fetchNews, formatNews } from "./news.js";
+import { DASHBOARD_SCHEMA, EXTRACTION_SYSTEM, FIELDS, REPORT_SYSTEM, CHAT_SYSTEM } from "./prompts.js";
+
+const app = express();
+app.use(cors({ origin: process.env.FRONTEND_ORIGIN }));
+app.use(express.json({ limit: "2mb" }));
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+
+// In-memory store for the demo. Replace with PostgreSQL/MongoDB for production.
+const store = new Map();
+
+// Keep prompts within a safe size. For big documents, replace this with chunking + embeddings.
+const MAX_CHARS = Number(process.env.MAX_DOC_CHARS) || 24000;
+const clip = (t) => (t.length > MAX_CHARS ? t.slice(0, MAX_CHARS) : t);
+
+// 1) Upload a document -> text -> dashboard JSON
+app.post("/api/documents", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
+    const text = await extractText(req.file);
+    if (text.trim().length < 50) {
+      return res.status(422).json({ error: "Little or no text found. The file may be a scan (OCR needed)." });
+    }
+
+    const dashboard = await extractJson(
+      EXTRACTION_SYSTEM,
+      `Schema:\n${JSON.stringify(DASHBOARD_SCHEMA, null, 2)}\n\nDocument:\n${clip(text)}`
+    );
+
+    const id = randomUUID();
+    store.set(id, { id, filename: req.file.originalname, text, dashboard, reports: {}, news: [] });
+    res.json({ id, filename: req.file.originalname, dashboard });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2) Generate the 5 reports (in parallel) + market news context
+app.post("/api/documents/:id/reports", async (req, res) => {
+  try {
+    const doc = store.get(req.params.id);
+    if (!doc) return res.status(404).json({ error: "Document not found" });
+
+    const industry = req.body?.industry || "beverage industry";
+    const news = await fetchNews(`${industry} supply chain OR sales OR market`);
+    doc.news = news;
+    const newsText = formatNews(news);
+
+    const entries = await Promise.all(
+      Object.entries(FIELDS).map(async ([key, field]) => {
+        const report = await chat([
+          { role: "system", content: REPORT_SYSTEM },
+          {
+            role: "user",
+            content:
+              `Write the "${field.title}" report.\nFocus areas: ${field.focus}\n\n` +
+              `Department KPIs (JSON):\n${JSON.stringify(doc.dashboard.departments?.[key] ?? {})}\n\n` +
+              `Cross-department KPIs (JSON):\n${JSON.stringify(doc.dashboard.cross_department ?? {})}\n\n` +
+              `Document text:\n${clip(doc.text)}\n\n` +
+              `Recent news (market context):\n${newsText}`
+          }
+        ]);
+        return [key, report];
+      })
+    );
+
+    doc.reports = Object.fromEntries(entries);
+    res.json({ reports: doc.reports, news });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3) Chatbot: answers from the document, the reports and the news
+app.post("/api/documents/:id/chat", async (req, res) => {
+  try {
+    const doc = store.get(req.params.id);
+    if (!doc) return res.status(404).json({ error: "Document not found" });
+
+    const { message, history = [] } = req.body;
+    if (!message) return res.status(400).json({ error: "Missing message" });
+
+    const context =
+      `DOCUMENT: ${doc.filename}\n\nEXTRACTED DATA:\n${JSON.stringify(doc.dashboard)}\n\n` +
+      `REPORTS:\n${Object.entries(doc.reports).map(([k, v]) => `## ${FIELDS[k].title}\n${v}`).join("\n\n")}\n\n` +
+      `MARKET NEWS:\n${formatNews(doc.news)}\n\n` +
+      `DOCUMENT TEXT:\n${clip(doc.text)}`;
+
+    const answer = await chat([
+      { role: "system", content: `${CHAT_SYSTEM}\n\nCONTEXT:\n${context}` },
+      ...history.slice(-10),
+      { role: "user", content: message }
+    ], { temperature: 0.3 });
+
+    res.json({ answer });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.listen(process.env.PORT || 3001, () => console.log("API running on port", process.env.PORT || 3001));
+
+
+===== backend\llm.js =====
+
+import OpenAI from "openai";
+import "dotenv/config";
+
+// Works with any OpenAI-compatible provider (AI Grid, Together, DeepInfra, OpenRouter, Ollama, vLLM...).
+// Everything is configured in .env, no code change needed.
+const { LLM_BASE_URL, LLM_API_KEY, LLM_MODEL } = process.env;
+
+if (!LLM_BASE_URL || !LLM_MODEL) {
+  throw new Error("Missing LLM_BASE_URL or LLM_MODEL in backend/.env (see .env.example).");
+}
+
+const client = new OpenAI({
+  apiKey: LLM_API_KEY || "not-needed",   // some local servers need no key
+  baseURL: LLM_BASE_URL
+});
+
+// Gemma-friendly switches
+const JSON_MODE = process.env.LLM_JSON_MODE !== "false";       // ask the API for JSON output
+const MERGE_SYSTEM = process.env.LLM_MERGE_SYSTEM === "true";  // Gemma templates often have no "system" role
+
+// If the provider has no system role, fold the system text into the first user message.
+function prepare(messages) {
+  if (!MERGE_SYSTEM) return messages;
+  const system = messages.filter((m) => m.role === "system").map((m) => m.content).join("\n\n");
+  const rest = messages.filter((m) => m.role !== "system");
+  if (!system) return rest;
+  const i = rest.findIndex((m) => m.role === "user");
+  if (i === -1) return [{ role: "user", content: system }, ...rest];
+  rest[i] = { ...rest[i], content: `${system}\n\n---\n\n${rest[i].content}` };
+  return rest;
+}
+
+export async function chat(messages, { json = false, temperature = 0.2 } = {}) {
+  const base = { model: LLM_MODEL, messages: prepare(messages), temperature };
+
+  try {
+    const res = await client.chat.completions.create({
+      ...base,
+      ...(json && JSON_MODE ? { response_format: { type: "json_object" } } : {})
+    });
+    return res.choices[0].message.content;
+  } catch (err) {
+    // Some providers reject response_format for Gemma: retry once without it.
+    if (json && JSON_MODE && err.status === 400) {
+      console.warn("Provider rejected JSON mode, retrying without it. Set LLM_JSON_MODE=false to skip this.");
+      const res = await client.chat.completions.create(base);
+      return res.choices[0].message.content;
+    }
+    throw err;
+  }
+}
+
+// Pulls a JSON object out of the reply even if the model adds text or ```json fences.
+function parseJson(raw) {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
+    if (start === -1 || end === -1) throw new Error("Model did not return JSON.");
+    return JSON.parse(raw.slice(start, end + 1));
+  }
+}
+
+export async function extractJson(system, user) {
+  const attempt = async (extra = "") =>
+    parseJson(
+      await chat(
+        [
+          { role: "system", content: system },
+          { role: "user", content: user + extra }
+        ],
+        { json: true, temperature: 0 }
+      )
+    );
+
+  try {
+    return await attempt();
+  } catch {
+    // One retry with a stricter reminder (small models sometimes break the JSON).
+    return await attempt("\n\nReturn ONLY one valid JSON object. No text before or after it.");
+  }
+}
+
+
+===== backend\prompts.js =====
+
+// ---------------------------------------------------------------------------
+// OUTPUT SCHEMA: one block per department, like a Power BI report with one page per department.
+// ---------------------------------------------------------------------------
+const KPI_SHAPE = {
+  id: "string (snake_case, stable, e.g. gross_margin_pct)",
+  label: "string (short, chart-ready)",
+  value: "number | null",
+  unit: "string (e.g. EUR, %, hL, L, cases, days, hours, x)",
+  period: "string | null (e.g. 'Q3 2026', 'Oct 2026', 'FY2025')",
+  source: "'reported' (stated in the document) | 'calculated' (derived by you)",
+  formula: "string | null (required when source = 'calculated', e.g. 'revenue - cogs')",
+  previous_value: "number | null",
+  change_pct: "number | null (vs previous_value, or vs target if that is all that exists)",
+  target_value: "number | null",
+  status: "'good' | 'warning' | 'critical' | 'neutral'",
+  confidence: "'high' | 'medium' | 'low'"
+};
+
+const CHART_SHAPE = {
+  id: "string",
+  title: "string",
+  type: "'line' | 'bar' | 'stacked_bar' | 'donut' | 'waterfall' | 'scatter' | 'gauge' | 'table'",
+  x_label: "string | null",
+  y_label: "string | null",
+  unit: "string | null",
+  series: [{ name: "string", data: [{ label: "string", value: "number" }] }],
+  why_it_matters: "string (one sentence for the dashboard viewer)"
+};
+
+const DEPARTMENT_SHAPE = {
+  kpis: [KPI_SHAPE],
+  charts: [CHART_SHAPE],
+  insights: ["string (max 3, each tied to a number in the data)"],
+  data_gaps: ["string (KPIs from the catalog that could not be computed and which data is missing)"]
+};
+
+export const DASHBOARD_SCHEMA = {
+  document_title: "string",
+  document_date: "string | null (ISO date)",
+  reporting_period: "string | null",
+  currency: "string | null",
+  summary: "string (max 3 sentences, executive level)",
+  departments: {
+    sales: DEPARTMENT_SHAPE,
+    production: DEPARTMENT_SHAPE,
+    stock: DEPARTMENT_SHAPE,
+    procurement: DEPARTMENT_SHAPE,
+    finance: DEPARTMENT_SHAPE
+  },
+  cross_department: {
+    kpis: [KPI_SHAPE],
+    insights: ["string (links between departments, e.g. sales run-rate vs stock coverage)"]
+  },
+  entities: { products: ["string"], suppliers: ["string"], customers: ["string"], channels: ["string"], regions: ["string"] },
+  risks_or_alerts: [{ department: "string", severity: "'high' | 'medium' | 'low'", message: "string" }]
+};
+
+// ---------------------------------------------------------------------------
+// KPI CATALOG: what a BI analyst would build for a beverage manufacturer.
+// The model computes what the data allows and reports the rest as data_gaps.
+// ---------------------------------------------------------------------------
+export const KPI_CATALOG = {
+  sales: {
+    title: "Sales",
+    kpis: [
+      "Net revenue (total, and by product category: water, soft drinks, juices, energy drinks, beer/alcohol, other)",
+      "Volume sold (hL, L, cases or units, whichever the document uses)",
+      "Average selling price per liter / per case = revenue / volume",
+      "Revenue growth % (MoM, QoQ, YoY when comparable periods exist)",
+      "Revenue and volume by SKU, by pack format (PET, glass, can, keg), by channel (retail, wholesale, HoReCa, e-commerce, export), by region, by customer",
+      "Top 5 / Top 10 products and customers as % of revenue (concentration)",
+      "Sales vs target / budget (attainment %)",
+      "Gross margin % by product or category (if cost data exists)",
+      "Discounts, promotions and returns as % of gross sales",
+      "Returnable packaging / deposit return rate (if applicable)",
+      "Market share % (if the document provides market data)"
+    ],
+    charts: [
+      "Revenue trend over time (line)",
+      "Revenue by category (donut or stacked bar)",
+      "Top customers / SKUs (bar)",
+      "Actual vs target (bar or gauge)",
+      "Revenue by channel or region (bar)"
+    ]
+  },
+  production: {
+    title: "Production",
+    kpis: [
+      "Total output (hL, L or units) and planned vs actual output (plan attainment %)",
+      "Output by production line / plant / product",
+      "Capacity utilization % = actual output / available capacity",
+      "OEE % = availability x performance x quality (if the three components exist, else report any component alone)",
+      "Downtime (hours) and downtime % of planned time, with main causes",
+      "Yield % = good output / total input",
+      "Scrap / waste rate % (product loss, broken bottles, rejected batches)",
+      "Quality: batch rejection rate %, non-conformities, complaints per million units",
+      "Production cost per liter (or per hL) = production cost / output",
+      "Water usage ratio = liters of water per liter of product (key beverage sustainability KPI)",
+      "Energy consumption per hL (kWh/hL) and CO2 or sugar/ingredient loss if reported",
+      "Line speed (bottles or cans per minute) and changeover time"
+    ],
+    charts: [
+      "Planned vs actual output (bar)",
+      "OEE or capacity utilization trend (line or gauge)",
+      "Downtime by cause (bar)",
+      "Scrap rate by line (bar)",
+      "Cost per liter trend (line)"
+    ]
+  },
+  stock: {
+    title: "Stock / Inventory",
+    kpis: [
+      "Total inventory value, split finished goods vs raw materials vs packaging (concentrate, sugar, CO2, preforms, bottles, cans, caps, labels, cartons)",
+      "Inventory turnover = COGS / average inventory",
+      "Days of inventory (DIO) = inventory / COGS x days in period",
+      "Stock coverage in days = current stock / average daily demand or consumption",
+      "Stock-out rate % and number of stock-outs by SKU",
+      "Service level / fill rate % (orders fulfilled complete)",
+      "Near-expiry or expired stock % of inventory (shelf-life risk, critical for beverages)",
+      "Write-offs and shrinkage (value and % of inventory)",
+      "Slow-moving / obsolete stock (items with no movement over X days)",
+      "Overstock vs reorder point and safety stock gaps",
+      "Warehouse utilization %"
+    ],
+    charts: [
+      "Inventory value by category (stacked bar)",
+      "Stock coverage days by SKU (bar with threshold)",
+      "Expiry risk breakdown (donut)",
+      "Inventory turnover trend (line)",
+      "Top slow movers (table)"
+    ]
+  },
+  procurement: {
+    title: "Procurement",
+    kpis: [
+      "Total procurement spend and spend by category (PET preforms, glass, cans, sugar / sweeteners, concentrate, CO2, caps and labels, cartons, energy, services)",
+      "Spend by supplier and top-5 supplier concentration %",
+      "Purchase price variance (PPV) = (actual price - standard price) x quantity",
+      "Unit price trend of key raw materials (sugar, PET, aluminum, glass)",
+      "Supplier OTIF % (on time, in full) and average lead time in days",
+      "Supplier quality: rejection / non-conformity rate %",
+      "Contract coverage % (spend under contract) and single-source dependency",
+      "Savings achieved vs target (value and %)",
+      "Materials cost as % of COGS or of revenue",
+      "Payment terms / DPO (days payable outstanding)",
+      "Open purchase orders and delayed deliveries"
+    ],
+    charts: [
+      "Spend by category (donut or bar)",
+      "Top suppliers (bar)",
+      "Raw material price trend (line)",
+      "Supplier OTIF vs target (bar)",
+      "Savings vs target (waterfall or bar)"
+    ]
+  },
+  finance: {
+    title: "Finance",
+    kpis: [
+      "Revenue, COGS, gross profit and gross margin %",
+      "Operating expenses and operating margin %",
+      "EBITDA and EBITDA margin %",
+      "Net income and net margin %",
+      "Cost per liter and contribution margin per liter or by product",
+      "Budget vs actual variance (value and %) for revenue, costs, EBITDA",
+      "Operating cash flow and free cash flow",
+      "Working capital = current assets - current liabilities",
+      "DSO (receivables days), DIO (inventory days), DPO (payables days) and cash conversion cycle = DSO + DIO - DPO",
+      "Liquidity: current ratio, quick ratio",
+      "Leverage: debt / equity, net debt / EBITDA, interest coverage",
+      "ROCE or ROI, and CAPEX (value and % of revenue)"
+    ],
+    charts: [
+      "Revenue, COGS and margin trend (line or combo)",
+      "P&L bridge / waterfall from revenue to net income",
+      "Budget vs actual (bar)",
+      "Cash flow trend (bar)",
+      "Cash conversion cycle components (stacked bar)"
+    ]
+  }
+};
+
+export const CROSS_DEPARTMENT_KPIS = [
+  "Revenue per liter vs production cost per liter vs materials cost per liter (unit economics)",
+  "Stock coverage (days) vs sales run-rate: risk of stock-out or overstock",
+  "Production output vs sales volume: gap = inventory build-up or shortfall",
+  "Materials cost % of COGS vs raw material price trend (procurement impact on margin)",
+  "Scrap / waste cost as % of revenue (production impact on finance)",
+  "Cash conversion cycle drivers: link DIO to stock, DPO to procurement terms, DSO to sales terms"
+];
+
+// ---------------------------------------------------------------------------
+// EXTRACTION PROMPT: the analyst brief sent as the system message.
+// ---------------------------------------------------------------------------
+const catalogText = Object.entries(KPI_CATALOG)
+  .map(([key, d]) =>
+    `### ${key.toUpperCase()} (${d.title})\nKPIs to build:\n${d.kpis.map((k) => `- ${k}`).join("\n")}\nCharts to build:\n${d.charts.map((c) => `- ${c}`).join("\n")}`
+  )
+  .join("\n\n");
+
+export const EXTRACTION_SYSTEM = `You are a senior BI / data analyst designing a Power BI dashboard for a BEVERAGE manufacturer (water, soft drinks, juices, energy drinks, possibly beer or spirits).
+You are given one business document. Build the dataset behind the dashboard: KPIs and chart-ready data for 5 departments (Sales, Production, Stock/Inventory, Procurement, Finance) plus cross-department KPIs.
+
+WORKING METHOD (follow in order, silently):
+1. Read the whole document. Identify the reporting period, currency, units (hL, L, cases, units) and the products, lines, suppliers, customers, channels and regions mentioned.
+2. Normalize units and currency. Never mix units in one KPI. If conversion is needed and the factor is stated in the document, convert; otherwise keep the original unit.
+3. For each department, go through its KPI catalog below. For every KPI decide: (a) reported directly in the document, (b) calculable from reported numbers, or (c) not possible.
+4. For (a) copy the value exactly. For (b) compute it carefully, set source = "calculated" and write the formula with the actual inputs used. For (c) do NOT include the KPI; list it in the department's data_gaps with the missing data.
+5. Add previous_value and change_pct whenever the document offers a comparable period, budget or target. Never compute a change from numbers that are not comparable.
+6. Set status: use the document's own targets or thresholds when they exist. Otherwise use common beverage-industry sense only when the direction is unambiguous (e.g. stock-outs rising, scrap rising, margin falling = warning or critical). If unsure, use "neutral".
+7. Build the charts: only from data that really exists in the document. Each chart needs real data points, a clear title and a one-sentence why_it_matters. Prefer 2 to 5 charts per department, fewer if data is thin. A chart with fewer than 2 data points is not allowed.
+8. Write insights: max 3 per department, each one must cite a number from the data. No generic advice.
+9. Fill cross_department with the cross-department KPIs that the data allows, and risks_or_alerts with the most important issues (severity high only for clear, material problems).
+10. Double check: every number must be traceable to the document or to a formula you wrote. Percentages in percent units (12.5 not 0.125). Numbers are plain numbers: no currency symbols, no thousands separators.
+
+STRICT RULES:
+- Return ONLY valid JSON that matches the schema. No markdown, no comments.
+- NEVER invent, estimate or "typically assume" a figure. A missing KPI is better than a made-up one.
+- If the document does not concern a department at all, return empty arrays for it and put one data_gaps entry saying so.
+- Use stable snake_case ids so the frontend can reference KPIs (e.g. gross_margin_pct, stock_coverage_days, oee_pct).
+- Keep labels short and consistent across departments.
+
+KPI CATALOG BY DEPARTMENT:
+${catalogText}
+
+CROSS-DEPARTMENT KPIs (only if both sides exist in the data):
+${CROSS_DEPARTMENT_KPIS.map((k) => `- ${k}`).join("\n")}`;
+
+// ---------------------------------------------------------------------------
+// REPORTS
+// ---------------------------------------------------------------------------
+export const FIELDS = {
+  sales: { title: "Sales", focus: KPI_CATALOG.sales.kpis.join("; ") },
+  production: { title: "Production", focus: KPI_CATALOG.production.kpis.join("; ") },
+  stock: { title: "Stock / Inventory", focus: KPI_CATALOG.stock.kpis.join("; ") },
+  procurement: { title: "Procurement", focus: KPI_CATALOG.procurement.kpis.join("; ") },
+  finance: { title: "Finance", focus: KPI_CATALOG.finance.kpis.join("; ") }
+};
+
+export const REPORT_SYSTEM = `You are a senior business analyst for a beverage manufacturer, writing a professional report in English.
+Base every statement on the provided KPI data and document text. If the document has no information for a section, say so plainly instead of guessing.
+Always cite the KPI value, unit and period when you mention a figure, and say whether it is reported or calculated.
+You may use the news context to comment on the market (consumer demand, sugar / PET / aluminum prices, energy costs, regulation such as sugar taxes or packaging rules, weather and seasonality), but label it clearly as market context and never present it as a figure from the document.
+Structure the report with these sections:
+1. Executive summary
+2. Key figures (a compact table: KPI, value, vs previous / target, status)
+3. Analysis and trends
+4. Risks and points of attention
+5. Market context (from news)
+6. Recommendations (specific and actionable, tied to the numbers above)
+Be concise, precise and professional.`;
+
+export const CHAT_SYSTEM = `You are a professional business assistant for a beverage company dashboard.
+You answer questions about the uploaded document(s), the department KPIs, the generated reports (Sales, Production, Stock/Inventory, Procurement, Finance) and the market context from recent news.
+Rules:
+- Answer only from the provided context. If the answer is not there, say so clearly and suggest what document or data would help.
+- Quote figures exactly as they appear, with units and periods. Say when a KPI is calculated and show the formula if asked.
+- Distinguish clearly between facts from the document and market context from news.
+- When relevant, connect departments (for example sales volume vs stock coverage, or raw material prices vs margin).
+- Keep a professional, concise tone. Use short lists or tables only when they help.`;
+
+
+===== backend\news.js =====
+
+import "dotenv/config";
+
+// Fetches recent headlines to give the LLM market context.
+// Uses NewsAPI's "everything" endpoint; swap for GNews or another provider if you prefer.
+export async function fetchNews(query, limit = 8) {
+  if (!process.env.NEWS_API_KEY) return [];
+
+  const url = new URL("https://newsapi.org/v2/everything");
+  url.searchParams.set("q", query);
+  url.searchParams.set("language", "en");
+  url.searchParams.set("sortBy", "publishedAt");
+  url.searchParams.set("pageSize", String(limit));
+  url.searchParams.set("apiKey", process.env.NEWS_API_KEY);
+
+  const res = await fetch(url);
+  if (!res.ok) return [];
+  const data = await res.json();
+
+  return (data.articles || []).map((a) => ({
+    title: a.title,
+    source: a.source?.name,
+    date: a.publishedAt,
+    description: a.description,
+    url: a.url
+  }));
+}
+
+export function formatNews(articles) {
+  if (!articles.length) return "No recent news available.";
+  return articles
+    .map((a) => `- [${a.date?.slice(0, 10)}] ${a.title} (${a.source}): ${a.description ?? ""}`)
+    .join("\n");
+}
+
+
+===== backend\extract-text.js =====
+
+// Import the inner file: the package root runs a debug routine under ESM and crashes.
+import pdf from "pdf-parse/lib/pdf-parse.js";
+import mammoth from "mammoth";
+
+// Converts an uploaded file buffer to plain text.
+// Scanned PDFs (images only) return almost no text: add OCR (e.g. Tesseract) if you need them.
+export async function extractText(file) {
+  const name = file.originalname.toLowerCase();
+
+  if (name.endsWith(".pdf")) {
+    const data = await pdf(file.buffer);
+    return data.text;
+  }
+  if (name.endsWith(".docx")) {
+    const { value } = await mammoth.extractRawText({ buffer: file.buffer });
+    return value;
+  }
+  if (name.endsWith(".txt") || name.endsWith(".csv") || name.endsWith(".md")) {
+    return file.buffer.toString("utf-8");
+  }
+  throw new Error("Unsupported file type. Use PDF, DOCX, TXT or CSV.");
+}
+
+
+===== backend\package.json =====
+
+{
+  "name": "doc-ai-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mammoth": "^1.8.0",
+    "multer": "^1.4.5-lts.1",
+    "openai": "^4.67.0",
+    "pdf-parse": "^1.1.1"
+  }
+}
+
+
+===== backend\.env.example =====
+
+# ---- LLM (Gemma from AI Grid, or any OpenAI-compatible provider) ----
+# Copy these three values from your AI Grid dashboard / docs.
+LLM_BASE_URL=https://YOUR-AI-GRID-ENDPOINT/v1
+LLM_API_KEY=your_ai_grid_key_here
+LLM_MODEL=your-gemma-model-name
+
+# Gemma switches (change only if you get errors):
+# false = do not ask the API for JSON mode (use if the provider rejects it)
+LLM_JSON_MODE=true
+# true = merge the system prompt into the user message (use if the provider says "system role not supported")
+LLM_MERGE_SYSTEM=false
+
+# Max characters of the document sent to the model (about 4 characters = 1 token).
+# Lower it if your Gemma context window is small.
+MAX_DOC_CHARS=24000
+
+# ---- Market news (optional) ----
+NEWS_API_KEY=your_news_api_key_here
+
+# ---- Server ----
+PORT=3001
+FRONTEND_ORIGIN=http://localhost:5173
+
+
+===== frontend\src\DocAssistant.jsx =====
+
+// Drop-in React example. Your frontend only talks to YOUR backend, never to the LLM directly.
+import { useState } from "react";
+
+const API = "http://localhost:3001/api";
+
+export default function DocAssistant() {
+  const [doc, setDoc] = useState(null);       // { id, filename, dashboard }
+  const [reports, setReports] = useState({});
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  async function handleUpload(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    setLoading(true);
+    const form = new FormData();
+    form.append("file", file);
+
+    const res = await fetch(`${API}/documents`, { method: "POST", body: form });
+    const data = await res.json();
+    setDoc(data);                               // data.dashboard feeds your charts/KPI cards
+
+    const rep = await fetch(`${API}/documents/${data.id}/reports`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({})
+    });
+    setReports((await rep.json()).reports);
+    setLoading(false);
+  }
+
+  async function send() {
+    if (!input.trim() || !doc) return;
+    const history = messages;
+    setMessages([...history, { role: "user", content: input }]);
+    setInput("");
+
+    const res = await fetch(`${API}/documents/${doc.id}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: input, history })
+    });
+    const { answer } = await res.json();
+    setMessages((m) => [...m, { role: "assistant", content: answer }]);
+  }
+
+  return (
+    <div>
+      <input type="file" accept=".pdf,.docx,.txt,.csv" onChange={handleUpload} />
+      {loading && <p>Analyzing document...</p>}
+
+      {doc && (
+        <>
+          <h2>{doc.dashboard.document_title}</h2>
+          <div>
+            {Object.entries(doc.dashboard.departments).map(([dept, d]) => (
+              <section key={dept}>
+                <h3>{dept}</h3>
+                {d.kpis.map((k) => (
+                  <div key={k.id}>
+                    {k.label}: {k.value} {k.unit}
+                    {k.change_pct != null && ` (${k.change_pct}%)`} [{k.status}]
+                  </div>
+                ))}
+                {/* d.charts[i] = { type, title, series } -> feed to Recharts / Chart.js */}
+                {d.data_gaps.length > 0 && <small>Missing: {d.data_gaps.join("; ")}</small>}
+              </section>
+            ))}
+          </div>
+
+          {Object.entries(reports).map(([field, text]) => (
+            <section key={field}>
+              <h3>{field}</h3>
+              <pre style={{ whiteSpace: "pre-wrap" }}>{text}</pre>
+            </section>
+          ))}
+
+          <div>
+            {messages.map((m, i) => <p key={i}><b>{m.role}:</b> {m.content}</p>)}
+            <input value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && send()} />
+            <button onClick={send}>Send</button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
